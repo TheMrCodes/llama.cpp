@@ -2019,6 +2019,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 device->subgroup_size_control &&
                                 device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32;
     const uint32_t cm1_sg = cm1_use_wave32 ? 32 : device->subgroup_size;
+    const bool xe1_mesa = device->architecture == INTEL_XE1 &&
+                          device->driver_id == vk::DriverId::eIntelOpenSourceMESA &&
+                          device->subgroup_size_control && device->subgroup_min_size <= 8;
 
     vk_pipeline wait_pipeline;
     CompileTask claimed_task {};
@@ -2155,7 +2158,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->vendor_id == VK_VENDOR_ID_INTEL && device->coopmat_support) {
             // Xe1/Xe2/Xe3 with coopmat enabled - warptile performance tuning
             l_warptile = { 512, 128, 128, 16, mm_warp_8, 32, 2, tm_l, tn_l, tk_l, mm_warp_8 };
-            if (device->architecture == INTEL_XE1) {
+            if (xe1_mesa) {
+                l_warptile     = { 256, 128, 128, 16, 16, 32, 2, tm_l, tn_l, tk_l, 8 };
+                l_warptile_mmq = { 256, 128, 128, 32, 16, 32, 2, tm_l, tn_l, tk_l, 8 };
+                m_warptile     = { 128,  64,  64, 16, 16, 16, 2, tm_m, tn_m, tk_m, 8 };
+                m_warptile_mmq = { 128,  64,  64, 32, 16, 16, 2, tm_m, tn_m, tk_m, 8 };
+                s_warptile     = {  32,  32,  32, 16, 16, 16, 2, tm_s, tn_s, tk_s, 8 };
+                s_warptile_mmq = {  32,  32,  32, 32, 16, 16, 2, tm_s, tn_s, tk_s, 8 };
+                l_align        = 32;  //set as BK
+            } else if (device->architecture == INTEL_XE1) {
                 l_warptile_mmq  = { 512, 256, 128, 32, 32, 32, 2, tm_l, tn_l, tk_l, 16 };
                 l_mmq_wg_denoms = { 256, 128, 1 };
                 l_align         = 32;  //set as BK
@@ -2579,7 +2590,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (is_int) {
             enabled[0] = is_id ? device->mul_mat_id_s_int[type] : device->mul_mat_s_int[type];
             enabled[1] = is_id ? device->mul_mat_id_m_int[type] : device->mul_mat_m_int[type];
-            enabled[2] = is_id ? device->mul_mat_id_l_int[type] : device->mul_mat_l_int[type];
+            enabled[2] = !xe1_mesa && (is_id ? device->mul_mat_id_l_int[type] : device->mul_mat_l_int[type]);
         } else {
             enabled[0] = is_id ? device->mul_mat_id_s[type] : device->mul_mat_s[type];
             enabled[1] = is_id ? device->mul_mat_id_m[type] : device->mul_mat_m[type];
@@ -2773,7 +2784,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
         // Intel coopmat1 uses a dedicated large-tile config for quant matmul_id.
         std::vector<vk_tile_config> tc_mmq_id = tc_mmq;
-        if (cm1_pin) {
+        if (cm1_pin && !xe1_mesa) {
             tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
         }
 
@@ -2958,13 +2969,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             cm1_create_mmq({GGML_TYPE_Q6_K,   GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_q6_k_q8_1",   matmul_id_subgroup_q6_k_q8_1_cm1_len,   matmul_id_subgroup_q6_k_q8_1_cm1_data,   sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count);
             if (!rdna4) { cm1_create_mmq({GGML_TYPE_NVFP4, GGML_TYPE_Q8_1, true, false}, tc_mmq_cm1_int_k, "matmul_id_subgroup_nvfp4_q8_1",  matmul_id_subgroup_nvfp4_q8_1_cm1_len,  matmul_id_subgroup_nvfp4_q8_1_cm1_data,  sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); }
         }
-    } else
+    }
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    if (!device->coopmat2 && (!device->coopmat_support || xe1_mesa))
     {
         // Helper for subgroup path with dot2 selection and filtering
         auto sg_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                              const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc,
                              uint32_t rsgs = 0) {
+            if (device->coopmat_support) {
+                return;
+            }
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
             if (!tc.empty()) create_mm_pipelines(key, tc, name, len, data, pc_size, pc,
                 [&](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec(wt, a); },
@@ -2973,6 +2988,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         auto sg_create_quant = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
                                    const std::string& name, size_t len, const void* data, uint32_t pc_size, uint32_t pc,
                                    uint32_t rsgs = 0) {
+            if (device->coopmat_support) {
+                return;
+            }
             auto tc = filter_tc(tc_base, key.type_a, key.mul_mat_id);
             if (!tc.empty()) {
                 spec_fn_t qs = [&, type_a=key.type_a](const std::vector<uint32_t>& wt, bool a) { return ggml_vk_mul_mm_spec_quant(wt, a, (uint32_t)type_a); };
@@ -5179,8 +5197,9 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
 
 #if defined(VK_KHR_cooperative_matrix)
-        device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
-        device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support;
+        device->coopmat_support = device->coopmat_support && device->fp16 && coopmat_features.cooperativeMatrix;
+        device->coopmat1_fa_support = device->coopmat_support && device->subgroup_require_full_support &&
+                                      !(device->architecture == INTEL_XE1 && device->driver_id == vk::DriverId::eIntelOpenSourceMESA);
 #endif
 
 #if defined(GGML_VULKAN_COOPMAT_MAINTENANCE1_GLSLC_SUPPORT)
@@ -17662,7 +17681,10 @@ bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& 
     case VK_VENDOR_ID_INTEL:
         // Only allowing Xe2/Xe3 GPU and integrated Xe GPUs at the moment since older hardware (ex. Arc A770) has performance regressions.
         return (arch == vk_device_architecture::INTEL_XE2) ||
-            (arch == vk_device_architecture::INTEL_XE1 && props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu && driver_props.driverID == vk::DriverId::eIntelProprietaryWindows);
+            (arch == vk_device_architecture::INTEL_XE1 &&
+             (driver_props.driverID == vk::DriverId::eIntelOpenSourceMESA ||
+              (props.deviceType == vk::PhysicalDeviceType::eIntegratedGpu &&
+               driver_props.driverID == vk::DriverId::eIntelProprietaryWindows)));
     case VK_VENDOR_ID_AMD:
         if (driver_props.driverID == vk::DriverId::eAmdProprietary || driver_props.driverID == vk::DriverId::eAmdOpenSource) {
             // Workaround for AMD proprietary driver reporting support on all GPUs
